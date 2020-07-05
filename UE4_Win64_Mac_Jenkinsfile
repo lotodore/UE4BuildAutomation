@@ -1,0 +1,154 @@
+pipeline
+{
+	agent none
+	parameters
+	{
+		choice(
+				name: 'PLATFORM_FILTER',
+				choices: ['windows', 'mac', 'all'],
+				description: '')
+		choice(
+				name: 'ENGINE_VERSION',
+				choices: [ 'UE_4_24_3' ],
+				description: '')
+		choice(
+				name: 'BUILD_CONFIGURATION',
+				choices: [ 'Development', 'Shipping' ],
+				description: '')
+		booleanParam(
+				name: 'COMPILE_GAME',
+				defaultValue: true,
+				description: '')
+	}
+	environment
+	{
+		BUILD_PROJECT_NAME = "$env.JOB_BASE_NAME"
+	}
+	options
+	{
+		// Default checkout may not have git-lfs and may have bad timeouts.
+		skipDefaultCheckout(true)
+	}
+	stages
+	{
+		stage('BuildAndDeploy')
+		{
+			matrix {
+				agent {
+					label "${PLATFORM}"
+				}
+				when { anyOf {
+					expression { params.PLATFORM_FILTER == 'all' }
+					expression { params.PLATFORM_FILTER == env.PLATFORM }
+				} }
+				axes {
+					axis {
+						name 'PLATFORM'
+						values 'windows', 'mac'
+					}
+				}
+				stages
+				{
+					stage('Preparation')
+					{
+						environment
+						{
+							BUILD_ARCHIVE_DIR = getBuildArchivePath()
+						}
+						steps
+						{
+							// Checkout code changes.
+							checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout'], [$class: 'GitLFSPull'], [$class: 'CheckoutOption', timeout: 60], [$class: 'CloneOption', noTags: false, reference: '', shallow: false, timeout: 60]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'scm', url: 'https://bitbucket.org/replace_with_your/project.git']]]
+							// Create project files (e.g. Visual Studio Solution).
+							pwsh script: startProcess(getUnrealBuildToolPath(), "-projectfiles -project=`\"${env.WORKSPACE}/${env.BUILD_PROJECT_NAME}.uproject`\" -game -engine")
+							// Build editor dlls for project.
+							pwsh script: startProcess(getUnrealBuildToolPath(), "${env.BUILD_PROJECT_NAME}Editor " + getUnrealPlatformName() + " Development `\"${env.WORKSPACE}/${env.BUILD_PROJECT_NAME}.uproject`\" -engine")
+							// Create folders for later steps.
+							pwsh script: 'if (!(Test-Path -Path "$env:BUILD_ARCHIVE_DIR/$env:BUILD_PROJECT_NAME")) { md "$env:BUILD_ARCHIVE_DIR/$env:BUILD_PROJECT_NAME" -Force }'
+						}
+					}
+					stage('Compile Blueprints')
+					{
+						steps
+						{
+							pwsh script: startProcess(getUnrealEditorCmdPath(), "`\"${env.WORKSPACE}/${env.BUILD_PROJECT_NAME}.uproject`\" -run=CompileAllBlueprints -IgnoreFolder=/Engine -Unattended")
+						}
+					}
+					stage('Build Game')
+					{
+						when
+						{
+							expression
+							{
+								params.COMPILE_GAME
+							}
+						}
+						environment
+						{
+							BUILD_ARCHIVE_DIR = getBuildArchivePath()
+						}
+						steps
+						{
+							pwsh script: 'Remove-Item "$env:BUILD_ARCHIVE_DIR/$env:BUILD_PROJECT_NAME/WindowsNoEditor" -Force -Recurse -ErrorAction SilentlyContinue'
+							pwsh script: startProcess(getUnrealAutomationToolPath(), getBuildArgsClient() + " -targetplatform=" + getUnrealPlatformName())
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+def getBuildArchivePath()
+{
+	if (env.PLATFORM == 'mac')			{ return '/Volumes/X5/Packages' }
+	else if (env.PLATFORM == 'windows')	{ return 'C:/Projects/Archive' }
+	else								{ throw new Exception('Unsupported platform') }
+}
+
+def getUnrealEngineRoot()
+{
+	if (env.PLATFORM == 'mac')			{ return "/Volumes/X5/Shared/$env.ENGINE_VERSION" }
+	else if (env.PLATFORM == 'windows')	{ return "C:/Projects/$env.ENGINE_VERSION" }
+	else								{ throw new Exception('Unsupported platform') }
+}
+
+def getUnrealBuildToolPath()
+{
+	if (env.PLATFORM == 'mac')			{ return getUnrealEngineRoot() + '/Engine/Build/BatchFiles/Mac/Build.sh' }
+	else if (env.PLATFORM == 'windows')	{ return getUnrealEngineRoot() + '/Engine/Build/BatchFiles/Build.bat' }
+	else								{ throw new Exception('Unsupported platform') }
+}
+
+def getUnrealAutomationToolPath()
+{
+	if (env.PLATFORM == 'mac')			{ return getUnrealEngineRoot() + '/Engine/Build/BatchFiles/RunUAT.command' }
+	else if (env.PLATFORM == 'windows')	{ return getUnrealEngineRoot() + '/Engine/Build/BatchFiles/RunUAT.bat' }
+	else								{ throw new Exception('Unsupported platform') }
+}
+
+def getUnrealEditorCmdPath()
+{
+	if (env.PLATFORM == 'mac')			{ return getUnrealEngineRoot() + '/Engine/Binaries/Mac/UE4Editor-Cmd' }
+	else if (env.PLATFORM == 'windows')	{ return getUnrealEngineRoot() + '/Engine/Binaries/Win64/UE4Editor-Cmd.exe' }
+	else								{ throw new Exception('Unsupported platform') }
+}
+
+def getUnrealPlatformName()
+{
+	if (env.PLATFORM == 'mac')			{ return 'Mac' }
+	else if (env.PLATFORM == 'windows')	{ return 'Win64' }
+	else								{ throw new Exception('Unsupported platform') }
+}
+
+def getBuildArgsClient()
+{
+	return "BuildCookRun -project=`\"${env.WORKSPACE}/${env.BUILD_PROJECT_NAME}.uproject`\" -nocompileeditor -nop4 -cook -stage -archive -archivedirectory=`\"$env.BUILD_ARCHIVE_DIR/$env.BUILD_PROJECT_NAME`\" -package -clean -compressed -pak -prereqs -distribution -nodebuginfo -build -target=$env.BUILD_PROJECT_NAME -clientconfig=$env.BUILD_CONFIGURATION -utf8output -compile"
+}
+
+def startProcess(String program, String parameters)
+{
+	String cmd = '$batch = Start-Process -FilePath "' + program + '" -ArgumentList "' + parameters + '" -Wait -PassThru -NoNewWindow -ErrorAction Stop; exit $batch.ExitCode'
+	echo cmd
+	return cmd
+}
